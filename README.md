@@ -1,5 +1,5 @@
-# Traffic-Vehicle-Detection
-## Take home assignment
+# Traffic-Vehicle-Tracking
+## Counting no of traffic vehicles using YOLOv5s with DeepSORT algorithm
 
 Script to count the number of instances per vehicle class for a given traffic video clip. 
 
