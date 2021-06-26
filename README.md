@@ -8,7 +8,18 @@ Script to count the number of instances per vehicle class for a given traffic vi
 - Opencv
 - FFMPEG
 
-#### Usage:
+
+#### Usage(for object tracking):
+In order to show the inferences on a video file, for example: traffic_short.mp4, use the following command:
+```sh
+python main.py --input_path traffic_short.mp4 --display
+```
+In order to save the tracking inferences in form of video, use the following command:
+```sh
+python main.py --input_path traffic_short.mp4 --save_path out.mp4 --device 0 --display
+```
+
+#### Usage(only for detection):
 In order to show the inferences on a video file, for example: traffic_short.mp4, use the following command:
 ```sh
 python main.py --video traffic_short.mp4 --show_detections

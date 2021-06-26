@@ -1,125 +1,331 @@
-import torch
-import cv2
-import numpy as np
+from yolov5.utils.general import (
+    check_img_size, non_max_suppression, scale_coords, xyxy2xywh)
+from yolov5.utils.torch_utils import select_device, time_synchronized
+from yolov5.utils.datasets import letterbox
+
+from utils_ds.parser import get_config
+from utils_ds.draw import draw_boxes
+from deep_sort import build_tracker
+
 import argparse
+import os
+import time
+import numpy as np
+import warnings
+import cv2
+import torch
+import torch.backends.cudnn as cudnn
+
 import sys
-from copy import deepcopy
-import tqdm
 
-def mark_detections(cap, model, distance_thres, disp_img = True):
-    
-    frames_arr = []
-    
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    fontScale = 1
+currentUrl = os.path.dirname(__file__)
+sys.path.append(os.path.abspath(os.path.join(currentUrl, 'yolov5')))
 
-    while(cap.isOpened()):
-        #cap.set(cv2.CAP_PROP_FPS, 10)
-        n_cars = 0
-        n_trucks = 0
-        n_bikes = 0
-        ret, frame = cap.read()
-        
-        if not ret:
-            break
-        
-        height, width, channels = frame.shape
-        
-        if not ret:
-            break
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        preds = model(frame_rgb)
-        
-        bboxes = preds.xyxy[0].detach().cpu().numpy()
-        #print(bboxes)
-        frame_cpy = frame_rgb.copy()
-        frame_cpy = cv2.line(frame_cpy, (400, distance_thres), (900, distance_thres), (0,0,255), 2)
-        for box in bboxes:
-            if box[1] >= distance_thres:
-                if box[5] == 2:
-                    n_cars += 1
-                    frame_cpy = cv2.rectangle(frame_cpy, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0,255,0), 2)
-                elif box[5] == 7:
-                    n_trucks += 1
-                    frame_cpy = cv2.rectangle(frame_cpy, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (255, 0, 0), 2)
-                elif box[5] == 3:
-                    n_bikes += 1
-                    frame_cpy = cv2.rectangle(frame_cpy, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 2)
 
-        frame_cpy = cv2.putText(frame_cpy, 'Cars: ' + str(n_cars), (40,40), font, fontScale, (255,0,0), 2, cv2.LINE_AA)
-        frame_cpy = cv2.putText(frame_cpy, 'Trucks: ' + str(n_trucks), (40,80), font, fontScale, (255,0,0), 2, cv2.LINE_AA)
-        frame_cpy = cv2.putText(frame_cpy, 'Bikes: ' + str(n_bikes), (40,120), font, fontScale, (255,0,0), 2, cv2.LINE_AA)
-        
-        if disp_img:
-            cv2.imshow('Traffic Feed', frame_cpy[:,:,::-1])
-            if cv2.waitKey(10) == ord('q'):
-                break
+cudnn.benchmark = True
+
+
+class VideoTracker(object):
+    def __init__(self, args):
+        print('Initialize DeepSORT & YOLO-V5')
+        # ***************** Initialize ******************************************************
+        self.args = args
+
+        self.img_size = args.img_size                   # image size in detector, default is 640
+        self.frame_interval = args.frame_interval       # frequency
+
+        self.device = select_device(args.device)
+        self.half = self.device.type != 'cpu'  # half precision only supported on CUDA
+
+        self.N_CARS = 0
+        self.N_TRUCKS = 0
+        self.finishline_dict = {}
+        self.finishline_truck_dict = {}
+        # create video capture ****************
+        if args.display:
+            cv2.namedWindow("test", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("test", args.display_width, args.display_height)
+
+        if args.cam != -1:
+            print("Using webcam " + str(args.cam))
+            self.vdo = cv2.VideoCapture(args.cam)
         else:
-            frames_arr.append(frame_cpy[:,:,::-1])
+            self.vdo = cv2.VideoCapture()
 
-    cap.release()
-    cv2.destroyAllWindows()
-    
-    return frames_arr, (width, height)
+        # ***************************** initialize DeepSORT **********************************
+        cfg = get_config()
+        cfg.merge_from_file(args.config_deepsort)
+
+        use_cuda = self.device.type != 'cpu' and torch.cuda.is_available()
+        self.deepsort = build_tracker(cfg, use_cuda=use_cuda)
+        self.deepsort_truck = build_tracker(cfg, use_cuda=use_cuda)
+
+        # ***************************** initialize YOLO-V5 **********************************
+        self.detector = torch.load(args.weights, map_location=self.device)['model'].float()  # load to FP32
+        self.detector.to(self.device).eval()
+        if self.half:
+            self.detector.half()  # to FP16
+
+        self.names = self.detector.module.names if hasattr(self.detector, 'module') else self.detector.names
+
+        print('Done..')
+        if self.device == 'cpu':
+            warnings.warn("Running in cpu mode which maybe very slow!", UserWarning)
+
+    def __enter__(self):
+        # ************************* Load video from camera *************************
+        if self.args.cam != -1:
+            print('Camera ...')
+            ret, frame = self.vdo.read()
+            assert ret, "Error: Camera error"
+            self.im_width = int(self.vdo.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.im_height = int(self.vdo.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # ************************* Load video from file *************************
+        else:
+            assert os.path.isfile(self.args.input_path), "Path error"
+            self.vdo.open(self.args.input_path)
+            self.im_width = int(self.vdo.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.im_height = int(self.vdo.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            assert self.vdo.isOpened()
+            print('Done. Load video file ', self.args.input_path)
+
+        # ************************* create output *************************
+        if self.args.save_path:
+            os.makedirs(self.args.save_path, exist_ok=True)
+            # path of saved video and results
+            self.save_video_path = os.path.join(self.args.save_path, "results.mp4")
+
+            # create video writer
+            fourcc = cv2.VideoWriter_fourcc(*self.args.fourcc)
+            self.writer = cv2.VideoWriter(self.save_video_path, fourcc,
+                                          self.vdo.get(cv2.CAP_PROP_FPS), (self.im_width, self.im_height))
+            print('Done. Create output file ', self.save_video_path)
+
+        if self.args.save_txt:
+            os.makedirs(self.args.save_txt, exist_ok=True)
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.vdo.release()
+        self.writer.release()
+        if exc_type:
+            print(exc_type, exc_value, exc_traceback)
+
+    def run(self):
+        yolo_time, sort_time, avg_fps = [], [], []
+        t_start = time.time()
+
+        idx_frame = 0
+        last_out = None
+        while self.vdo.grab():
+            # Inference *********************************************************************
+            t0 = time.time()
+            _, img0 = self.vdo.retrieve()
+
+            if idx_frame % self.args.frame_interval == 0:
+                outputs, outputs_truck, yt, st = self.image_track(img0)        # (#ID, 5) x1,y1,x2,y2,id
+                last_out = outputs
+                yolo_time.append(yt)
+                sort_time.append(st)
+                print('Frame %d Done. YOLO-time:(%.3fs) SORT-time:(%.3fs)' % (idx_frame, yt, st))
+            else:
+                outputs = last_out  # directly use prediction in last frames
+            t1 = time.time()
+            avg_fps.append(t1 - t0)
+
+            #update the finishline tracking module
+            
+            
+            # post-processing ***************************************************************
+            # visualize bbox  ********************************
+            if len(outputs) > 0:
+                self.finishline_tracker(outputs, mode='c')
+                bbox_xyxy = outputs[:, :4]
+                identities = outputs[:, -1]
+                img0 = draw_boxes(img0, bbox_xyxy, identities, caption='Car')  # BGR
+
+                # add FPS information on output video
+                text_scale = max(1, img0.shape[1] // 1600)
+                cv2.putText(img0, 'frame: %d fps: %.2f ' % (idx_frame, len(avg_fps) / sum(avg_fps)),
+                        (20, 20 + text_scale), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255), thickness=2)
+                
+                img0 = cv2.line(img0, (400, 300), (900, 300), (0,0,255), 2)
+                img0 = cv2.line(img0, (100, 500), (1200, 500), (0,0,255), 2)
+                
+                img0 = cv2.putText(img0, 'Cars: ' + str(self.N_CARS), (40,50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2, cv2.LINE_AA)
+            
+            if len(outputs_truck)>0:
+                self.finishline_tracker(outputs_truck, mode='t')
+                bbox_xyxy = outputs_truck[:, :4]
+                identities = outputs_truck[:, -1]
+                img0 = draw_boxes(img0, bbox_xyxy, identities, caption='Truck')  # BGR
+            
+            img0 = cv2.putText(img0, 'Trucks: ' + str(self.N_TRUCKS), (40,80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2, cv2.LINE_AA)
+                
+            
+            # display on window *****************************
+            if self.args.display:
+                cv2.imshow("test", img0)
+                if cv2.waitKey(1) == ord('q'):  # q to quit
+                    cv2.destroyAllWindows()
+                    break
+
+            # save to video file *****************************
+            if self.args.save_path:
+                self.writer.write(img0)
+
+            if self.args.save_txt:
+                with open(self.args.save_txt + str(idx_frame).zfill(4) + '.txt', 'a') as f:
+                    for i in range(len(outputs)):
+                        x1, y1, x2, y2, idx = outputs[i]
+                        f.write('{}\t{}\t{}\t{}\t{}\n'.format(x1, y1, x2, y2, idx))
 
 
-def disp_detections(video, conf_thres, iou_thres, distance_thres):
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-    model.iou = iou_thres
-    model.conf = conf_thres
-    
-    cap = cv2.VideoCapture(video)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    print("Current FPS of video:", fps)
-    
-    _, _ = mark_detections(cap, model, distance_thres, disp_img=True)
 
-def save_video_output(video, conf_thres, iou_thres, save_path, distance_thres):
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-    model.iou = iou_thres
-    model.conf = conf_thres
+            idx_frame += 1
+
+        print('Avg YOLO time (%.3fs), Sort time (%.3fs) per frame' % (sum(yolo_time) / len(yolo_time),
+                                                            sum(sort_time)/len(sort_time)))
+        t_end = time.time()
+        print('Total time (%.3fs), Total Frame: %d' % (t_end - t_start, idx_frame))
+
+    def image_track(self, im0):
+        """
+        :param im0: original image, BGR format
+        :return:
+        """
+        # preprocess ************************************************************
+        # Padded resize
+        img = letterbox(im0, new_shape=self.img_size)[0]
+        # Convert
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+
+        # numpy to tensor
+        img = torch.from_numpy(img).to(self.device)
+        img = img.half() if self.half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
+        s = '%gx%g ' % img.shape[2:]    # print string
+
+        # Detection time *********************************************************
+        # Inference
+        t1 = time_synchronized()
+        with torch.no_grad():
+            pred = self.detector(img, augment=self.args.augment)[0]  # list: bz * [ (#obj, 6)]
+
+        # Apply NMS and filter object other than person (cls:0)
+        pred = non_max_suppression(pred, self.args.conf_thres, self.args.iou_thres,
+                                   classes=self.args.classes, agnostic=self.args.agnostic_nms)
+        t2 = time_synchronized()
+
+        # get all obj ************************************************************
+        det = pred[0]  # for video, bz is 1
+        if det is not None and len(det):  # det: (#obj, 6)  x1 y1 x2 y2 conf cls
+
+            # Rescale boxes from img_size to original im0 size
+            det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+            # Print results. statistics of number of each obj
+            for c in det[:, -1].unique():
+                n = (det[:, -1] == c).sum()  # detections per class
+                s += '%g %ss, ' % (n, self.names[int(c)])  # add to string
+
+            det = self.filter_bboxes(det)
+            det_orig = torch.clone(det)
+            det = det[det[:, -1]==2]
+            det_truck = det_orig[det_orig[:, -1]!=2]
+            
+            #print(len(det_truck))
+            
+            bbox_xywh = xyxy2xywh(det[:, :4]).cpu()
+            confs = det[:, 4:5].cpu()
+            
+            bbox_xywh_truck = xyxy2xywh(det_truck[:, :4]).cpu()
+            confs_truck = det_truck[:, 4:5].cpu()
+            
+            # ****************************** deepsort ****************************
+            outputs = self.deepsort.update(bbox_xywh, confs, im0)
+            
+            if len(det_truck):
+                outputs_truck = self.deepsort_truck.update(bbox_xywh_truck, confs_truck, im0)
+            else:
+                outputs_truck = []
+            #print(outputs_truck)
+            # (#ID, 5) x1,y1,x2,y2,track_ID
+        else:
+            outputs = torch.zeros((0, 5))
+
+        t3 = time.time()
+        return outputs, outputs_truck, t2-t1, t3-t2
+
+   
+    def filter_bboxes(self, bbox_outputs):
+        xyxy = bbox_outputs.cpu()
+        print(xyxy.shape)
+        xyxy_f = xyxy[xyxy[:, 1]>=300]
+        xyxy_z = xyxy_f[xyxy_f[:,1]<=550]
+        #xyxy_l = xyxy_z[xyxy_z[:,3]<500]
+        return xyxy_z
     
-    cap = cv2.VideoCapture(video)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    print("Current FPS of video:", fps)
-    
-    print("Processing inferences on all frames...")
-    frames_arr, dims = mark_detections(cap, model, distance_thres, disp_img=False)    
-    
-    vid_out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'MP4V'), fps, dims)
-    pbar = tqdm.tqdm(total=len(frames_arr), desc='Frame', position=0)
-    for frame in frames_arr:
-        vid_out.write(frame)
-        pbar.update(1)
-    
-    vid_out.release()
-    print("Detection video processing completed.")
+    def finishline_tracker(self, tracking_bboxes, mode='c'):
+        #tracking_bboxes = tracking_bboxes.cpu().numpy()
+        if mode=='c':
+            for box in tracking_bboxes:
+                if box[-1] not in self.finishline_dict.keys():
+                    if box[1] >= 500:
+                        self.finishline_dict[box[-1]] = {'Y':box[1], 'Direction': 'UP'}
+                    elif box[1] <= 300:
+                        self.finishline_dict[box[-1]] = {'Y':box[1], 'Direction': 'DOWN'}
+            
+            self.N_CARS = len(self.finishline_dict.keys())
+        elif mode=='t':
+            for box in tracking_bboxes:
+                if box[-1] not in self.finishline_truck_dict.keys():
+                    if box[1] >= 400:
+                        self.finishline_truck_dict[box[-1]] = {'Y':box[1], 'Direction': 'UP'}
+                    elif box[1] <= 350:
+                        self.finishline_truck_dict[box[-1]] = {'Y':box[1], 'Direction': 'DOWN'}   
+            
+            self.N_TRUCKS = len(self.finishline_truck_dict.keys())         
+        return
 
 
-def parse_opt():
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, default='traffic_short.mp4', help='MP4 file with traffic video sequence')
-    parser.add_argument('--conf_thres', type=float, default=0.20, help='confidence threshold')
-    parser.add_argument('--iou_thres', type=float, default=0.15, help='NMS IoU threshold')
-    parser.add_argument('--show_detections', action='store_true', help='Display sequence of detections with instance count')
-    parser.add_argument('--save_path', type=str, default='', help='MP4 file with detection output')
-    parser.add_argument('--distance_thres', default=300, type=int, help='Threshold for distance beyond which bboxes will not be counted')
-    opt = parser.parse_args()
-    return opt
+    # input and output
+    parser.add_argument('--input_path', type=str, default='input_480.mp4', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--save_path', type=str, default='output/', help='output folder')  # output folder
+    parser.add_argument("--frame_interval", type=int, default=2)
+    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--save_txt', default='output/predict/', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
 
-def main(opt):
-    if opt.show_detections:
-        opt_dt = deepcopy(opt)
-        del opt_dt.show_detections, opt_dt.save_path
-        disp_detections(**vars(opt_dt))
-    
-    if len(opt.save_path):
-        opt_dt = deepcopy(opt)
-        del opt_dt.show_detections
-        save_video_output(**vars(opt_dt))
-        
-    
+    # camera only
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--display_width", type=int, default=800)
+    parser.add_argument("--display_height", type=int, default=600)
+    parser.add_argument("--camera", action="store", dest="cam", type=int, default="-1")
 
-if __name__=='__main__':
-    opt = parse_opt()
-    main(opt)
+    # YOLO-V5 parameters
+    parser.add_argument('--weights', type=str, default='yolov5/weights/yolov5s.pt', help='model.pt path')
+    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.2, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.25, help='IOU threshold for NMS')
+    parser.add_argument('--classes', nargs='+', type=int, default=[2,7,3], help='filter by class')
+    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+
+    # deepsort parameters
+    parser.add_argument("--config_deepsort", type=str, default="./configs/deep_sort.yaml")
+
+    args = parser.parse_args()
+    args.img_size = check_img_size(args.img_size)
+    print(args)
+
+    with VideoTracker(args) as vdo_trk:
+        vdo_trk.run()
+
