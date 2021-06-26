@@ -3,6 +3,8 @@
 
 Script to count the number of instances per vehicle class for a given traffic video clip. 
 
+![Traffic tracking](configs/thumb.png)
+
 #### Main components:
 - Pytorch
 - Opencv
